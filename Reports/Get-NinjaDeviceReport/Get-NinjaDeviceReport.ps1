@@ -4,13 +4,12 @@ NinjaOne Device Report Script (Standalone, Secure)
 =========================================================================================
 
 Author:     walkerAU
-Version:    1.1
+Version:    1.2
 Date:       2025-10-22
-Purpose:    This PowerShell script connects to the NinjaOne API using OAuth2 Client 
+Purpose:    This PowerShell script connects to the NinjaOne API using Client 
             Credentials (via an encrypted secret file), retrieves all organizations, 
-            locations, and devices (with pagination), and outputs a clean, readable table 
-            of devices including creation date, system name, organization, location, 
-            approval status, and last contact time.
+            locations, and devices (with pagination), and outputs a clean, readable 
+            table or CSV report with key device details.
 
 -----------------------------------------------------------------------------------------
 KEY FEATURES
@@ -20,7 +19,7 @@ KEY FEATURES
 - Authenticates automatically (OAuth2 Client Credentials flow).
 - Handles pagination for organizations, locations, and devices.
 - Supports device filtering via the NinjaOne `df` (device filter) parameter.
-- Displays output in a color-coded, neatly truncated table sorted by organization and system name.
+- Displays a neatly formatted table sorted by organization and system name.
 - Optional report export to CSV.
 
 -----------------------------------------------------------------------------------------
@@ -74,6 +73,7 @@ OUTPUT FIELDS
 -----------------------------------------------------------------------------------------
 - created          : Date/time device was created (converted from Unix timestamp)
 - systemName       : System name of the device
+- nodeClass        : Device type/class (e.g. WINDOWS_SERVER, WINDOWS_WORKSTATION)
 - organizationName : Friendly organization name (via /organizations)
 - locationName     : Device location name (via /locations)
 - approvalStatus   : Device approval status
@@ -86,7 +86,6 @@ NOTES
 - Default OAuth2 scope is 'monitoring'.
 - Region-based API endpoints (https://<region>.ninjarmm.com/api/v2).
 - Pagination handled automatically for large result sets.
-- Console output is color-coded for clarity (info, success, warning, error).
 
 =========================================================================================
 #>
@@ -205,12 +204,6 @@ function Invoke-NinjaAfterPagination {
     return $AllResults
 }
 
-function Truncate-String($Value, $MaxLength) {
-    if ($null -eq $Value) { return "" }
-    if ($Value.Length -le $MaxLength) { return $Value }
-    return $Value.Substring(0, $MaxLength - 3) + "..."
-}
-
 # =====================================================================================
 # MAIN SCRIPT LOGIC
 # =====================================================================================
@@ -244,8 +237,9 @@ if ($Devices -and $Devices.Count -gt 0) {
         [PSCustomObject]@{
             created          = (Get-Date 1970-01-01).AddSeconds([math]::Floor($_.created))
             systemName       = $_.systemName
-            organizationName = Truncate-String $OrgLookup[$_.organizationId] 30
-            locationName     = Truncate-String $LocationLookup[$_.locationId] 25
+			nodeClass        = $_.nodeClass
+            organizationName = $OrgLookup[$_.organizationId]
+            locationName     = $LocationLookup[$_.locationId]
             approvalStatus   = $_.approvalStatus
             offline          = $_.offline
             lastContact      = if ($_.lastContact) { (Get-Date 1970-01-01).AddSeconds([math]::Floor($_.lastContact)) } else { $null }
