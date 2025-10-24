@@ -1,7 +1,7 @@
 # 🖥️ Get-NinjaDeviceReport.ps1
 
 A secure PowerShell script that connects to the NinjaOne API using OAuth2 client credentials.  
-It retrieves organizations, locations, and devices (with pagination and optional filtering) and outputs a clean, readable table or CSV report showing each device’s creation date, system name, organization, location, approval status, and last contact time.
+It retrieves organizations, locations, and devices (with pagination and optional filtering) and outputs a clean, readable table or CSV report with key device details such as system name, organization, location, approval status, and last contact time.”
 
 ## ⚙️ 1. Prerequisites
 
@@ -89,6 +89,7 @@ For a full list of available filter options, see the official [NinjaOne Device F
 When you run the script, it outputs a clean PowerShell table with the following fields. If `-CreateReport` is set to `$true`, the same data is also exported to the CSV file specified by `-ReportPath`.
 
 ```text
-created              systemName     organizationName    locationName     approvalStatus    offline    lastContact
--------              -----------    ----------------    -------------    ---------------   --------   ------------
-2025-02-12 10:42:11  AHO-WSL12F9Z   Example IT          Sydney Office    APPROVED          False      2025-10-22 08:33:27
+created              systemName     nodeClass           organizationName    locationName     approvalStatus    offline    lastContact
+-------              -----------    ---------           ----------------    -------------    ---------------   --------   ------------
+2025-02-12 10:42:11  AHO-WSL12F9Z   WINDOWS_WORKSTATION Example IT          Sydney Office    APPROVED          False      2025-10-22 08:33:27
+
