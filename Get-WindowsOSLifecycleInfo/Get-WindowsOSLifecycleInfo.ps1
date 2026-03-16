@@ -664,7 +664,7 @@ if ($EnableWysiwyg) {
 
       # Body
       $CardHTML.Add('  <div class="card-body" style="margin:0; padding:0;">')
-      $CardHTML.Add('    <div role="table" style="margin:0; padding:0; width:100%; box-sizing:border-box; display:inline-block;">')
+      $CardHTML.Add('    <div role="table" style="margin:0; padding:0; width:100%; box-sizing:border-box;">')
 
       # --- Subheading helper ---
       function Add-Header {
@@ -716,13 +716,16 @@ if ($EnableWysiwyg) {
 
       Add-Header "Lifecycle Information" $CardHTML
 
+      # 1) Lifecycle match removed
+      # 2) Release label turned into link to endoflife.date product page
       $releaseLabelLinked = "<a href='$eolProductPage' target='_blank'>$($match.Label)</a>"
-
       Add-Row "Release label"          $releaseLabelLinked                               $CardHTML $LabelColWidth
       Add-Row "Release date"           $match.ReleaseDate.ToString("dd/MM/yyyy")         $CardHTML $LabelColWidth
       Add-Row "Latest build"           $match.LatestBuild                                $CardHTML $LabelColWidth
-      Add-Row "End of Active Support"  $eoasColored                                       $CardHTML $LabelColWidth
-      Add-Row "End of Life"            $eolColored                                        $CardHTML $LabelColWidth
+
+      Add-Row "End of Active Support"  $eoasColored                                      $CardHTML $LabelColWidth
+      Add-Row "End of Life"            $eolColored                                       $CardHTML $LabelColWidth
+
       Add-Row "Reference"              "<a href='$($match.Link)' target='_blank'>$($match.Link)</a>" $CardHTML $LabelColWidth
 
       $CardHTML.Add("</div>")
