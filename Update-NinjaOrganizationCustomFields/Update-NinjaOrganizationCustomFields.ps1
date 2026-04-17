@@ -4,13 +4,19 @@ Update-NinjaOrganizationCustomFields - NinjaOne Organization Custom Field Bulk U
 =========================================================================================
 
 Author:     walkerAU
-Version:    1.0
-Date:       2025-10-24
+Version:    1.1
+Date:       2026-04-17
 Purpose:    This PowerShell script connects to the NinjaOne API using Client 
             Credentials (via an encrypted secret file), reads a CSV of organizations 
             and custom field values, and updates a specified custom field for each 
             matching organization. It supports case-insensitive matching by name and 
             uses encrypted authentication for secure execution.
+
+Change Log:
+            v1.1 (2026-04-17)
+            - Added support for Multi-Select custom fields.
+            - Added custom field type resolution/check before updates.
+            - Multi-Select values are now split from CSV by ';' and sent as an array.
 			
 Requirements:
 			The API client must have both "monitoring" and "management" scopes enabled
@@ -38,6 +44,8 @@ Tech Corp,XYZ456
 
 - The "organization" column must exactly match the organization name in NinjaOne.
 - The "customfieldvalue" column contains the value to assign.
+- For Multi-Select custom fields, separate values with semicolons inside customfieldvalue
+  (example: "Option 1;Option 2;Option 3").
 
 -----------------------------------------------------------------------------------------
 SECURE SETUP: ENCRYPTED CLIENT SECRET
@@ -181,6 +189,36 @@ function Get-NinjaOrganizations {
     }
 }
 
+function Get-NinjaCustomFieldTypeInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$Session,   # Authenticated API session object
+        [Parameter(Mandatory)][string]$FieldName          # Custom field name to resolve
+    )
+
+    $EncodedFieldName = [System.Uri]::EscapeDataString($FieldName)
+    $Uri = "$($Session.BaseApiUri)/custom-fields/field-name/$EncodedFieldName"
+
+    Write-Host "Resolving custom field metadata for '$FieldName'..." -ForegroundColor Cyan
+
+    try {
+        $FieldDefinition = Invoke-RestMethod -Uri $Uri `
+            -Headers @{ Authorization = "Bearer $($Session.AccessToken)" } `
+            -ErrorAction Stop
+
+        if (-not $FieldDefinition -or -not $FieldDefinition.type) {
+            throw "Custom field metadata did not include a field type."
+        }
+
+        Write-Host ("Resolved field type: {0}`n" -f $FieldDefinition.type) -ForegroundColor Green
+        return $FieldDefinition
+    }
+    catch {
+        Write-Host "Failed to resolve custom field metadata: $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+}
+
 function Set-NinjaOrganizationCustomField {
     [CmdletBinding()]
     param(
@@ -233,6 +271,13 @@ if (-not $Session) { return }
 $Organizations = Get-NinjaOrganizations -Session $Session
 if (-not $Organizations) { return }
 
+# --- Resolve Target Custom Field Type Info ---
+$CustomFieldTypeInfo = Get-NinjaCustomFieldTypeInfo -Session $Session -FieldName $CustomFieldName
+if (-not $CustomFieldTypeInfo) { return }
+
+$CustomFieldType = "$($CustomFieldTypeInfo.type)".ToUpperInvariant()
+$IsMultiSelectType = $CustomFieldType -like '*MULTI_SELECT'
+
 # =====================================================================================
 # MAIN SCRIPT LOGIC
 # =====================================================================================
@@ -277,7 +322,17 @@ foreach ($row in $CsvData) {
     if ($Match) {
         $OrgId = $Match.id
         try {
-            Set-NinjaOrganizationCustomField -Session $Session -Id $OrgId -Fields @{ $CustomFieldName = $CustomValue } | Out-Null
+            $FieldValueForPatch = $CustomValue
+
+            if ($IsMultiSelectType) {
+                $Selections = $CustomValue -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+                if (-not $Selections -or $Selections.Count -eq 0) {
+                    throw "No valid selections parsed for multi-select field. Use ';' to separate values in CSV."
+                }
+                $FieldValueForPatch = @($Selections)
+            }
+
+            Set-NinjaOrganizationCustomField -Session $Session -Id $OrgId -Fields @{ $CustomFieldName = $FieldValueForPatch } | Out-Null
             Write-Host ("[UPDATED]   {0} (ID: {1})" -f $CsvName, $OrgId) -ForegroundColor Green
             $UpdatedCount++
         }
