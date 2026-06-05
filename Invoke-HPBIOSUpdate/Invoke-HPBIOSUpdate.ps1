@@ -5,13 +5,22 @@
 .DESCRIPTION
     Uses HP Client Management Script Library (HPCMSL) to check for and apply
     BIOS updates on supported HP devices. The script performs pre-flight checks
-    for HP hardware, administrator rights, and AC power before taking update
-    action.
+    for HP hardware and administrator rights before taking update action. AC
+    power is checked for reporting in all modes and enforced before install.
 
-    In Install mode, the script downloads the latest available BIOS update,
-    suspends BitLocker when enabled, and starts the BIOS flash process. In
-    Audit mode, it reports whether a newer BIOS is available without downloading
-    or flashing.
+    BIOS versions are compared using normalized HP version values to avoid false
+    update detections caused by differences between Windows-reported BIOS strings
+    and HP catalog versions.
+
+    In Install mode, the script downloads the latest applicable BIOS update,
+    suspends BitLocker when enabled, and starts the BIOS flash process. After a
+    successful flash command, it records pending verification state so the result
+    can be confirmed after reboot.
+
+    In Audit mode, the script reports whether a newer BIOS is available. If a
+    previous Install run is pending reboot or failed post-reboot verification,
+    Audit reports that state instead of replacing it with a generic update
+    available result.
 
     A timestamped log is written for each run, and explicit exit codes are
     returned for reporting.
@@ -23,9 +32,9 @@
     Defaults to Audit.
 
 .PARAMETER WorkingPath
-    Base folder used by the script for logs and BIOS update files.
-    The script creates its own Packages and Logs subfolders under this path.
-    Existing files are not deleted.
+    Base folder used by the script for logs, BIOS update files, and state
+    tracking. The script creates Packages, Logs, and State subfolders under this
+    path. Existing files are not deleted.
     Defaults to C:\Temp\HP\BIOS.
 
 .PARAMETER BIOSPassword
@@ -35,7 +44,10 @@
 .PARAMETER SkipACPowerCheck
     Controls whether the AC power safety check is skipped.
     Defaults to $false.
-    Set to $true only when power state detection is unreliable or AC power is handled outside this script.
+    In Audit mode, missing AC power is logged but does not stop update checks.
+    In Install mode, missing AC power blocks the BIOS update unless this is set
+    to $true. Set to $true only when power state detection is unreliable or AC
+    power is handled outside this script.
 
 .PARAMETER CustomFieldName
     Optional NinjaOne custom field name.
@@ -52,6 +64,7 @@
     - Working path: C:\Temp\HP\BIOS
     - BIOS package path: C:\Temp\HP\BIOS\Packages
     - Log path: C:\Temp\HP\BIOS\Logs
+    - State path: C:\Temp\HP\BIOS\State
     - BitLocker suspension: 3 reboots
 
 .EXIT CODES
@@ -64,11 +77,16 @@
 .NOTES
     Author: Sam Walker
     Created: 2026-05-29
-    Version: 1.0.1
+    Version: 1.0.2
 
     This script is intended for HP devices only.
 
 .CHANGELOG
+    2026-06-05 - 1.0.2
+        - Added BIOS version normalization before declaring an update available.
+        - Preserved raw BIOS version values in logs and custom field updates.
+        - Added BIOS update state tracking so Audit can preserve pending reboot status and detect failed post-reboot verification.
+        - Changed AC power handling so Audit still checks update availability while Install remains blocked without AC power.
     2026-06-01 - 1.0.1
         - Improved HPCMSL install and import handling.
         - Added fallback support for older PowerShellGet versions.
@@ -161,6 +179,104 @@ function Set-NinjaCustomField {
     catch {
         Write-Log "Unable to set custom field '$CustomFieldName': $($_.Exception.Message)" "ERROR"
         exit $ExitScriptFailure
+    }
+}
+
+function ConvertTo-BIOSVersionInfo {
+    param(
+        [string]$Version
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        return $null
+    }
+
+    $matches = [regex]::Matches($Version, "\d+(?:\.\d+)+")
+
+    if ($matches.Count -ne 1) {
+        return $null
+    }
+
+    $versionToken = $matches[0].Value
+
+    try {
+        $comparableVersion = [version]$versionToken
+    }
+    catch {
+        return $null
+    }
+
+    [pscustomobject]@{
+        RawToken   = $versionToken
+        Comparable = $comparableVersion
+    }
+}
+
+function Compare-BIOSVersion {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    $leftVersionInfo = ConvertTo-BIOSVersionInfo -Version $Left
+    $rightVersionInfo = ConvertTo-BIOSVersionInfo -Version $Right
+
+    if (-not $leftVersionInfo -or -not $rightVersionInfo) {
+        return $null
+    }
+
+    return $leftVersionInfo.Comparable.CompareTo($rightVersionInfo.Comparable)
+}
+
+function Get-SystemBootTime {
+    $operatingSystem = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    return $operatingSystem.LastBootUpTime
+}
+
+function Get-BIOSUpdateState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -Path $Path -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -Path $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Unable to read BIOS update state file '$Path'. $($_.Exception.Message)" "WARN"
+        return $null
+    }
+}
+
+function Save-BIOSUpdateState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [psobject]$State
+    )
+
+    $stateDirectory = Split-Path -Path $Path -Parent
+    New-Item -Path $stateDirectory -ItemType Directory -Force | Out-Null
+
+    $State |
+        ConvertTo-Json -Depth 4 |
+        Set-Content -Path $Path -Encoding UTF8 -Force
+}
+
+function Remove-BIOSUpdateState {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (Test-Path -Path $Path -PathType Leaf) {
+        Remove-Item -Path $Path -Force
     }
 }
 
@@ -408,10 +524,13 @@ if ($Mode -notin @("Install", "Audit")) {
 
 $packagePath = Join-Path $WorkingPath "Packages"
 $logPath = Join-Path $WorkingPath "Logs"
+$statePath = Join-Path $WorkingPath "State"
+$biosUpdateStateFile = Join-Path $statePath "bios-update-state.json"
 
 New-Item -Path $WorkingPath -ItemType Directory -Force | Out-Null
 New-Item -Path $packagePath -ItemType Directory -Force | Out-Null
 New-Item -Path $logPath -ItemType Directory -Force | Out-Null
+New-Item -Path $statePath -ItemType Directory -Force | Out-Null
 
 $logTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $script:LogFile = Join-Path $logPath "HP-BIOS-Update-$logTimestamp.log"
@@ -420,6 +539,7 @@ Write-Log "Starting HP BIOS update process."
 Write-Log "Working path: $WorkingPath"
 Write-Log "BIOS package path: $packagePath"
 Write-Log "Log file: $script:LogFile"
+Write-Log "State file: $biosUpdateStateFile"
 Write-Log "Mode: $Mode"
 Write-Log "Skip AC power check: $SkipACPowerCheck"
 if (-not [string]::IsNullOrWhiteSpace($CustomFieldName)) {
@@ -458,6 +578,8 @@ Write-Log "Administrator rights confirmed."
 # AC Power Check
 # ============================================================
 
+$acPowerDetected = $true
+
 if ($SkipACPowerCheck) {
     Write-Log "AC power check skipped by parameter." "WARN"
 }
@@ -466,16 +588,22 @@ else {
 
     if ($battery) {
         if ($battery.BatteryStatus -ne 2) {
-            Write-Log "Device is not connected to AC power. Exiting." "ERROR"
-            Set-NinjaCustomField -Value "Blocked - AC power not detected"
-            exit $ExitNoACPower
+            $acPowerDetected = $false
+            Write-Log "Device is not connected to AC power." "WARN"
         }
-
-        Write-Log "AC power detected."
+        else {
+            Write-Log "AC power detected."
+        }
     }
     else {
         Write-Log "No battery detected. Assuming desktop or always-on power."
     }
+}
+
+if (-not $acPowerDetected -and $Mode -eq "Install") {
+    Write-Log "Install mode requires AC power. Exiting." "ERROR"
+    Set-NinjaCustomField -Value "Blocked - AC power not detected"
+    exit $ExitNoACPower
 }
 
 # ============================================================
@@ -492,8 +620,19 @@ $bios = Get-CimInstance Win32_BIOS
 $currentBIOSVersion = $bios.SMBIOSBIOSVersion
 $platformId = Get-HPDeviceProductID
 
+try {
+    $currentBootTime = Get-SystemBootTime
+}
+catch {
+    $currentBootTime = $null
+    Write-Log "Unable to determine system boot time. $($_.Exception.Message)" "WARN"
+}
+
 Write-Log "Current BIOS version: $currentBIOSVersion"
 Write-Log "HP Platform ID: $platformId"
+if ($currentBootTime) {
+    Write-Log "System boot time: $($currentBootTime.ToString('o'))"
+}
 
 # ============================================================
 # Check for Available BIOS Update
@@ -528,7 +667,7 @@ catch {
 }
 
 if (-not $availableUpdate) {
-    Write-Log "Failure category: No update available."
+    Write-Log "BIOS update status: No update available."
     Write-Log "No BIOS update found."
     Set-NinjaCustomField -Value "Up to date - Current BIOS $currentBIOSVersion"
     exit $ExitSuccess
@@ -545,6 +684,85 @@ if (-not $latestBIOSVersion) {
     Write-Log "Available update object: $($availableUpdate | Out-String)" "ERROR"
     Set-NinjaCustomField -Value "Error - HP CMSL did not return latest BIOS version"
     exit $ExitScriptFailure
+}
+
+Write-Log "Latest BIOS version reported by HP: $latestBIOSVersion"
+
+$biosUpdateState = Get-BIOSUpdateState -Path $biosUpdateStateFile
+
+if ($biosUpdateState) {
+    Write-Log "Existing BIOS update state found: $($biosUpdateState.state); target BIOS $($biosUpdateState.targetBIOSVersionRaw)."
+
+    if ($Mode -eq "Install") {
+        Write-Log "Install mode selected. Removing existing BIOS update state before attempting install."
+        Remove-BIOSUpdateState -Path $biosUpdateStateFile
+    }
+    elseif ($biosUpdateState.platformId -and ($biosUpdateState.platformId -ne $platformId)) {
+        Write-Log "BIOS update state platform '$($biosUpdateState.platformId)' does not match current platform '$platformId'. Ignoring state file." "WARN"
+    }
+    elseif (-not $biosUpdateState.targetBIOSVersionRaw) {
+        Write-Log "BIOS update state file does not contain a target BIOS version. Ignoring state file." "WARN"
+    }
+    else {
+        $stateTargetCompare = Compare-BIOSVersion -Left $currentBIOSVersion -Right $biosUpdateState.targetBIOSVersionRaw
+
+        if (($null -ne $stateTargetCompare -and $stateTargetCompare -ge 0) -or ($currentBIOSVersion -eq $biosUpdateState.targetBIOSVersionRaw)) {
+            Write-Log "Previously pending BIOS update has been verified. Current BIOS '$currentBIOSVersion' is at or above state target '$($biosUpdateState.targetBIOSVersionRaw)'."
+            Remove-BIOSUpdateState -Path $biosUpdateStateFile
+        }
+        else {
+            $stateBootTime = $null
+
+            if ($biosUpdateState.bootTimeAtCreation) {
+                try {
+                    $stateBootTime = [datetime]::Parse($biosUpdateState.bootTimeAtCreation)
+                }
+                catch {
+                    Write-Log "Unable to parse boot time from BIOS update state file. $($_.Exception.Message)" "WARN"
+                }
+            }
+
+            if ($currentBootTime -and $stateBootTime) {
+                if ($currentBootTime -eq $stateBootTime) {
+                    Write-Log "BIOS update command completed previously, and the device has not rebooted since that command."
+                    Set-NinjaCustomField -Value "Update pending verification - Target BIOS $($biosUpdateState.targetBIOSVersionRaw); reboot required"
+                    exit $ExitSuccess
+                }
+                elseif ($currentBootTime -gt $stateBootTime) {
+                    Write-Log "Device has rebooted since the BIOS update command, but BIOS version did not advance to target '$($biosUpdateState.targetBIOSVersionRaw)'." "ERROR"
+                    Set-NinjaCustomField -Value "Error - BIOS update did not apply after reboot; target BIOS $($biosUpdateState.targetBIOSVersionRaw)"
+                    exit $ExitScriptFailure
+                }
+                else {
+                    Write-Log "BIOS update state boot time is newer than current boot time. Treating update as pending verification." "WARN"
+                    Set-NinjaCustomField -Value "Update pending verification - Target BIOS $($biosUpdateState.targetBIOSVersionRaw); reboot required"
+                    exit $ExitSuccess
+                }
+            }
+            else {
+                Write-Log "BIOS update state exists, but boot time could not be validated. Treating update as pending verification." "WARN"
+                Set-NinjaCustomField -Value "Update pending verification - Target BIOS $($biosUpdateState.targetBIOSVersionRaw); reboot required"
+                exit $ExitSuccess
+            }
+        }
+    }
+}
+
+$currentBIOSVersionInfo = ConvertTo-BIOSVersionInfo -Version $currentBIOSVersion
+$latestBIOSVersionInfo = ConvertTo-BIOSVersionInfo -Version $latestBIOSVersion
+
+if ($currentBIOSVersionInfo -and $latestBIOSVersionInfo) {
+    Write-Log "BIOS version comparison: current raw '$currentBIOSVersion' extracted as '$($currentBIOSVersionInfo.RawToken)'; latest raw '$latestBIOSVersion' extracted as '$($latestBIOSVersionInfo.RawToken)'."
+
+    if ($currentBIOSVersionInfo.Comparable -ge $latestBIOSVersionInfo.Comparable) {
+        Write-Log "BIOS update status: No update available."
+        Write-Log "No BIOS update found."
+        Set-NinjaCustomField -Value "Up to date - Current BIOS $currentBIOSVersion; latest BIOS $latestBIOSVersion"
+        exit $ExitSuccess
+    }
+}
+else {
+    Write-Log "BIOS version comparison could not normalize one or both values. Current raw '$currentBIOSVersion'; latest raw '$latestBIOSVersion'. Proceeding because HP reported an available BIOS update." "WARN"
 }
 
 Write-Log "BIOS update available: current version $currentBIOSVersion; latest version $latestBIOSVersion."
@@ -632,7 +850,53 @@ try {
 
     Write-Log "BIOS flash command completed."
     Write-Log "A reboot may be required."
-    Set-NinjaCustomField -Value "Update staged - Current BIOS $currentBIOSVersion; staged BIOS $latestBIOSVersion; reboot required"
+
+    try {
+        $currentBIOSVersionInfoForState = ConvertTo-BIOSVersionInfo -Version $currentBIOSVersion
+        $targetBIOSVersionInfoForState = ConvertTo-BIOSVersionInfo -Version $latestBIOSVersion
+        $hpClientManagementModule = Get-Module HP.ClientManagement -ErrorAction SilentlyContinue
+        $bootTimeAtCreation = $null
+        $currentBIOSVersionToken = $null
+        $targetBIOSVersionToken = $null
+        $cmslVersion = $null
+
+        if ($currentBootTime) {
+            $bootTimeAtCreation = $currentBootTime.ToString("o")
+        }
+
+        if ($currentBIOSVersionInfoForState) {
+            $currentBIOSVersionToken = $currentBIOSVersionInfoForState.RawToken
+        }
+
+        if ($targetBIOSVersionInfoForState) {
+            $targetBIOSVersionToken = $targetBIOSVersionInfoForState.RawToken
+        }
+
+        if ($hpClientManagementModule) {
+            $cmslVersion = $hpClientManagementModule.Version.ToString()
+        }
+
+        $biosUpdateState = [pscustomobject]@{
+            state                  = "UpdateCommandCompleted"
+            createdAt              = (Get-Date).ToString("o")
+            bootTimeAtCreation     = $bootTimeAtCreation
+            platformId             = $platformId
+            currentBIOSVersionRaw  = $currentBIOSVersion
+            currentBIOSVersionToken = $currentBIOSVersionToken
+            targetBIOSVersionRaw   = $latestBIOSVersion
+            targetBIOSVersionToken = $targetBIOSVersionToken
+            cmslVersion            = $cmslVersion
+            workingPath            = $WorkingPath
+        }
+
+        Save-BIOSUpdateState -Path $biosUpdateStateFile -State $biosUpdateState
+        Write-Log "BIOS update state saved to '$biosUpdateStateFile'."
+    }
+    catch {
+        Write-Log "Unable to save BIOS update state. $($_.Exception.Message)" "WARN"
+    }
+
+    Set-NinjaCustomField -Value "Update pending verification - Current BIOS $currentBIOSVersion; target BIOS $latestBIOSVersion; reboot required"
     exit $ExitSuccess
 }
 catch {
